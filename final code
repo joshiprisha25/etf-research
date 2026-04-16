@@ -1,0 +1,1051 @@
+
+from arch import arch_model
+except ImportError:
+!pip install arch --quiet
+from arch import arch_model
+# =========================================================
+# FULL PIPELINE: INDICES, FACTORS, REGIMES, GARCH, BOOTSTRAP, PLOTS
+# (Derived from Achint's code with minimal changes, no information removed)
+# =========================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import yfinance as yf
+import statsmodels.api as sm
+
+from pandas_datareader import data as pdr
+from pandas_datareader.famafrench import FamaFrenchReader
+from arch import arch_model
+
+# =========================================================
+# GLOBAL SETTINGS
+# =========================================================
+
+START_DATE = "2000-01-01"
+
+today = pd.Timestamp.today().normalize()
+last_complete_month_end = (today.replace(day=1) - pd.Timedelta(days=1)).normalize()
+END_DATE = last_complete_month_end.strftime("%Y-%m-%d")
+
+# Rate regime rule based on 3-month change in monthly average 2Y yield
+RISE_THRESHOLD = 0.25    # +25 bps
+FALL_THRESHOLD = -0.25   # -25 bps
+RATE_CHANGE_LAG_MONTHS = 3
+
+# GARCH settings
+GARCH_P = 1
+GARCH_Q = 1
+
+# Bootstrap settings
+N_BOOT = 300        # raise to 500 or 1000 for final paper if runtime allows
+CI_LOW = 2.5
+CI_HIGH = 97.5
+RANDOM_SEED = 42
+
+rng = np.random.default_rng(RANDOM_SEED)
+
+# Sector indices (Yahoo Finance index symbols)
+index_map = {
+    "Small Cap": "^RUT",       # Russell 2000
+    "Mid Cap": "^MID",         # S&P MidCap 400
+    "Large Cap": "^GSPC",      # S&P 500
+    "Technology": "^SP500-45", # S&P 500 Information Technology
+    "Healthcare": "^SP500-35", # S&P 500 Health Care
+    "Real Estate": "^SP500-60" # S&P 500 Real Estate
+}
+
+sector_order = list(index_map.keys())
+ticker_order = [index_map[s] for s in sector_order]
+
+rate_state_order = ["Rising", "Neutral", "Falling"]
+
+# =========================================================
+# HELPER FUNCTIONS (SHARED)
+# =========================================================
+
+def classify_rate_state(x, rise_thr=RISE_THRESHOLD, fall_thr=FALL_THRESHOLD):
+    if pd.isna(x):
+        return np.nan
+    if x > rise_thr:
+        return "Rising"
+    elif x < fall_thr:
+        return "Falling"
+    else:
+        return "Neutral"
+
+def annualized_return_from_daily(returns: pd.Series) -> float:
+    returns = returns.dropna()
+    if len(returns) == 0:
+        return np.nan
+    gross = (1.0 + returns).prod()
+    return gross ** (252.0 / len(returns)) - 1.0
+
+def annualized_garch_vol_from_daily(returns: pd.Series, p=1, q=1) -> float:
+    """
+    Fit GARCH(p,q) to daily returns and annualize the average fitted conditional vol.
+    Returns volatility in decimal units, e.g. 0.20 = 20%.
+    """
+    returns = returns.dropna()
+    if len(returns) < 80:
+        return np.nan
+
+    x = 100.0 * returns
+
+    try:
+        model = arch_model(
+            x,
+            mean="Constant",
+            vol="GARCH",
+            p=p,
+            q=q,
+            dist="normal",
+            rescale=False
+        )
+        res = model.fit(disp="off")
+        cond_vol_pct = res.conditional_volatility  # percent units
+        ann_vol = cond_vol_pct.mean() / 100.0 * np.sqrt(252.0)
+        return float(ann_vol)
+    except Exception:
+        return np.nan
+
+def pct_fmt(x):
+    if pd.isna(x):
+        return ""
+    return f"{100*x:.1f}%"
+
+def bootstrap_by_month(series: pd.Series, stat_func, n_boot=300, rng=None):
+    """
+    Block bootstrap by month:
+    - series index must be daily DatetimeIndex
+    - resample whole months with replacement
+    - stat_func computes a scalar from the bootstrapped daily return series
+    """
+    series = series.dropna()
+    if len(series) == 0:
+        return np.nan, np.nan, np.array([])
+
+    df = series.to_frame("ret").copy()
+    df["Month"] = df.index.to_period("M")
+
+    month_groups = [g["ret"].copy() for _, g in df.groupby("Month")]
+    n_months = len(month_groups)
+
+    if n_months < 6:
+        return np.nan, np.nan, np.array([])
+
+    boot_stats = []
+
+    for _ in range(n_boot):
+        picked = rng.integers(0, n_months, size=n_months)
+        sampled = pd.concat([month_groups[i] for i in picked], ignore_index=True)
+        val = stat_func(sampled)
+        if np.isfinite(val):
+            boot_stats.append(val)
+
+    boot_stats = np.array(boot_stats, dtype=float)
+
+    if len(boot_stats) == 0:
+        return np.nan, np.nan, boot_stats
+
+    lo = np.percentile(boot_stats, CI_LOW)
+    hi = np.percentile(boot_stats, CI_HIGH)
+    return lo, hi, boot_stats
+
+def make_err_arrays(center, low, high):
+    """
+    Convert lower/upper CI bounds into matplotlib asymmetric error arrays.
+    """
+    lower = center - low
+    upper = high - center
+
+    lower = np.where(np.isfinite(lower) & (lower >= 0), lower, np.nan)
+    upper = np.where(np.isfinite(upper) & (upper >= 0), upper, np.nan)
+
+    return np.vstack([lower, upper])
+
+def local_ylim(vals, include_zero=False, positive_only=False):
+    vals = np.asarray(vals, dtype=float)
+    vals = vals[np.isfinite(vals)]
+
+    if len(vals) == 0:
+        return (0.0, 1.0) if positive_only else (-1.0, 1.0)
+
+    vmin = vals.min()
+    vmax = vals.max()
+
+    if include_zero:
+        vmin = min(vmin, 0.0)
+        vmax = max(vmax, 0.0)
+
+    if positive_only:
+        vmin = max(0.0, vmin)
+
+    if np.isclose(vmin, vmax):
+        if positive_only:
+            return (0.0, vmax * 1.25 if vmax > 0 else 1.0)
+        margin = max(1.0, 0.15 * abs(vmin)) if abs(vmin) > 0 else 1.0
+        return (vmin - margin, vmax + margin)
+
+    margin = 0.15 * (vmax - vmin)
+    low = vmin - margin
+    high = vmax + margin
+
+    if positive_only:
+        low = max(0.0, low)
+
+    return low, high
+
+# =========================================================
+# 1) DOWNLOAD INDEX DATA (DAILY) AND BUILD DAILY & MONTHLY RETURNS
+# =========================================================
+
+raw = yf.download(
+    tickers=ticker_order,
+    start=START_DATE,
+    end=(pd.Timestamp(END_DATE) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+    auto_adjust=False,
+    progress=False,
+)
+
+if "Adj Close" in raw.columns.get_level_values(0):
+    prices = raw["Adj Close"].copy()
+else:
+    prices = raw["Close"].copy()
+
+ticker_to_sector = {v: k for k, v in index_map.items()}
+prices = prices.rename(columns=ticker_to_sector)
+prices = prices[sector_order].sort_index()
+prices = prices.dropna(how="all")
+
+# Daily returns
+daily_ret = prices.pct_change().dropna(how="all")
+
+# Monthly end-of-month prices and returns
+monthly_prices = prices.resample("M").last()
+monthly_ret = monthly_prices.pct_change().dropna(how="all")
+monthly_ret.index = monthly_ret.index.to_period("M")
+
+# =========================================================
+# 2) 2-YEAR YIELD, MONTHLY AVERAGES, d2y, RATE STATES
+# =========================================================
+
+dgs2 = pdr.DataReader("DGS2", "fred", START_DATE, END_DATE).rename(columns={"DGS2": "DGS2"})
+dgs2 = dgs2.sort_index()
+dgs2["DGS2"] = dgs2["DGS2"].ffill()
+
+# Monthly average yield
+monthly_yield = dgs2["DGS2"].resample("M").mean().to_frame("DGS2_monthly_avg")
+
+# 1-month change in percentage points
+monthly_yield["d2y"] = monthly_yield["DGS2_monthly_avg"].diff(1)
+
+# 3-month change for regime classification
+monthly_yield["d2y_3m"] = monthly_yield["DGS2_monthly_avg"].diff(RATE_CHANGE_LAG_MONTHS)
+
+# Rate state classification
+monthly_yield["Rate_State"] = monthly_yield["d2y_3m"].apply(classify_rate_state)
+monthly_yield["Month"] = monthly_yield.index.to_period("M")
+
+print("\nMonth counts by rate state (from monthly_yield):")
+print(
+    monthly_yield.dropna(subset=["Rate_State"])
+    .groupby("Rate_State")["Month"]
+    .nunique()
+    .reindex(rate_state_order)
+    .fillna(0)
+    .astype(int)
+)
+
+# =========================================================
+# 3) FAMA-FRENCH FACTORS + MOMENTUM (MONTHLY)
+# =========================================================
+
+ff3_reader = FamaFrenchReader("F-F_Research_Data_Factors", start=START_DATE)
+ff3 = ff3_reader.read()[0].copy()
+
+mom_reader = FamaFrenchReader("F-F_Momentum_Factor", start=START_DATE)
+mom = mom_reader.read()[0].copy()
+
+ff3 = ff3.rename(columns={
+    "Mkt-RF": "MKT_RF",
+    "SMB": "SMB",
+    "HML": "HML",
+    "RF": "RF"
+})
+
+mom_col = [c for c in mom.columns if "Mom" in c][0]
+mom = mom.rename(columns={mom_col: "MOM"})
+
+ff3 = ff3[["MKT_RF", "SMB", "HML", "RF"]].copy()
+mom = mom[["MOM"]].copy()
+
+def to_month_period_index(df):
+    if not isinstance(df.index, pd.PeriodIndex):
+        df.index = pd.to_datetime(df.index.astype(str), format="%Y%m").to_period("M")
+    return df
+
+ff3 = to_month_period_index(ff3)
+mom = to_month_period_index(mom)
+
+ff3 = ff3 / 100.0
+mom = mom / 100.0
+
+# =========================================================
+# 4) BUILD MASTER MONTHLY DATASET (RETURNS + FACTORS + d2y + RATE STATE)
+# =========================================================
+
+# Monthly_yield to PeriodIndex
+monthly_yield_period = monthly_yield.copy()
+monthly_yield_period.index = monthly_yield_period["Month"]
+
+master = (
+    monthly_ret
+    .join(ff3, how="inner")
+    .join(mom, how="inner")
+    .join(monthly_yield_period[["d2y", "Rate_State"]], how="inner")
+)
+master = master.dropna()
+
+# Excess returns
+for sector in sector_order:
+    master[f"{sector}_excess"] = master[sector] - master["RF"]
+
+print("\nSample window used in regressions:")
+print(f"{master.index.min()} to {master.index.max()}")
+print("\nMaster dataset columns:")
+print(list(master.columns))
+
+# =========================================================
+# 5) FACTOR MODELS (FULL SAMPLE): CAPM, FF3, CARHART4, CARHART4 + d2y
+# =========================================================
+
+def run_ols(y, X):
+    """
+    OLS with HC3 robust standard errors.
+    """
+    data = pd.concat([y, X], axis=1).dropna()
+    y_clean = data.iloc[:, 0]
+    X_clean = data.iloc[:, 1:]
+    X_clean = sm.add_constant(X_clean)
+
+    model = sm.OLS(y_clean, X_clean).fit(cov_type="HC3")
+    return model
+
+def fit_all_models_for_sector(df, sector):
+    """
+    Returns dict of fitted models for a given sector.
+    """
+    y = df[f"{sector}_excess"]
+
+    models = {}
+
+    X_capm = df[["MKT_RF"]]
+    X_ff3 = df[["MKT_RF", "SMB", "HML"]]
+    X_carhart = df[["MKT_RF", "SMB", "HML", "MOM"]]
+    X_carhart_d2y = df[["MKT_RF", "SMB", "HML", "MOM", "d2y"]]
+
+    models["CAPM"] = run_ols(y, X_capm)
+    models["FF3"] = run_ols(y, X_ff3)
+    models["Carhart4"] = run_ols(y, X_carhart)
+    models["Carhart4 + d2y"] = run_ols(y, X_carhart_d2y)
+
+    return models
+
+all_results = []
+
+for sector in sector_order:
+    fitted = fit_all_models_for_sector(master, sector)
+
+    for model_name, res in fitted.items():
+        row = {
+            "Sector": sector,
+            "Model": model_name,
+            "Nobs": int(res.nobs),
+            "Adj_R2": res.rsquared_adj,
+            "Alpha_monthly_pct": 100.0 * res.params.get("const", np.nan),
+            "Alpha_tstat": res.tvalues.get("const", np.nan),
+        }
+
+        for var in ["MKT_RF", "SMB", "HML", "MOM", "d2y"]:
+            row[f"{var}_coef"] = res.params.get(var, np.nan)
+            row[f"{var}_se"] = res.bse.get(var, np.nan)
+            row[f"{var}_t"] = res.tvalues.get(var, np.nan)
+            ci = res.conf_int()
+            if var in ci.index:
+                row[f"{var}_ci_low"] = ci.loc[var, 0]
+                row[f"{var}_ci_high"] = ci.loc[var, 1]
+            else:
+                row[f"{var}_ci_low"] = np.nan
+                row[f"{var}_ci_high"] = np.nan
+
+        all_results.append(row)
+
+results_df = pd.DataFrame(all_results)
+
+print("\nRegression summary head (full sample):")
+display(results_df.head())
+
+# Gamma on d2y from Carhart4 + d2y
+gamma_df = (
+    results_df[results_df["Model"] == "Carhart4 + d2y"]
+    .set_index("Sector")
+    .reindex(sector_order)
+    .reset_index()
+)
+
+# Adjusted R^2 for all models
+r2_df = (
+    results_df.pivot(index="Sector", columns="Model", values="Adj_R2")
+    .reindex(sector_order)
+)
+
+model_order = ["CAPM", "FF3", "Carhart4", "Carhart4 + d2y"]
+r2_df = r2_df[model_order]
+
+print("\nInterest-rate sensitivity (gamma on d2y, full sample):")
+display(
+    gamma_df[[
+        "Sector", "d2y_coef", "d2y_se", "d2y_t", "d2y_ci_low", "d2y_ci_high", "Adj_R2"
+    ]].style.format({
+        "d2y_coef": "{:.4f}",
+        "d2y_se": "{:.4f}",
+        "d2y_t": "{:.2f}",
+        "d2y_ci_low": "{:.4f}",
+        "d2y_ci_high": "{:.4f}",
+        "Adj_R2": "{:.3f}",
+    })
+)
+
+print("\nAdjusted R^2 by sector and model (full sample):")
+display(r2_df.style.format("{:.3f}"))
+
+# =========================================================
+# 6) PLOT: FULL-SAMPLE GAMMA ON d2y + MODEL R^2 (1x2 FIGURE)
+# =========================================================
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 6), sharex=False)
+
+# LEFT PANEL: gamma on d2y
+ax = axes[0]
+
+x = np.arange(len(sector_order))
+gamma = gamma_df["d2y_coef"].values.astype(float)
+gamma_low = gamma_df["d2y_ci_low"].values.astype(float)
+gamma_high = gamma_df["d2y_ci_high"].values.astype(float)
+
+gamma_err = np.vstack([
+    gamma - gamma_low,
+    gamma_high - gamma
+])
+
+ax.bar(x, gamma, yerr=gamma_err, capsize=4)
+ax.axhline(0, linewidth=1)
+ax.grid(axis="y", alpha=0.25)
+
+ax.set_ylabel("Coefficient on Monthly Change in 2Y Yield", fontsize=11)
+ax.set_title("(a) Interest-Rate Sensitivity by Sector (Full Sample)", fontsize=13)
+ax.set_xticks(x)
+ax.set_xticklabels(sector_order, rotation=20, ha="right")
+
+ymin, ymax = local_ylim(np.concatenate([gamma, gamma_low, gamma_high]), include_zero=True, positive_only=False)
+ax.set_ylim(ymin, ymax)
+
+for i, (_, row) in enumerate(gamma_df.iterrows()):
+    tval = row["d2y_t"]
+    if np.isfinite(tval):
+        y_text = row["d2y_ci_high"] + 0.03 * (ymax - ymin)
+        ax.text(i, y_text, f"t={tval:.2f}", ha="center", va="bottom", fontsize=8)
+
+# RIGHT PANEL: Adjusted R^2
+ax = axes[1]
+
+width = 0.18
+x = np.arange(len(sector_order))
+
+for j, model_name in enumerate(model_order):
+    vals = r2_df[model_name].values.astype(float)
+    ax.bar(x + (j - 1.5) * width, vals, width=width, label=model_name)
+
+ax.grid(axis="y", alpha=0.25)
+ax.set_ylabel("Adjusted $R^2$", fontsize=11)
+ax.set_title("(b) Model Explanatory Power by Sector (Full Sample)", fontsize=13)
+ax.set_xticks(x)
+ax.set_xticklabels(sector_order, rotation=20, ha="right")
+
+r2_vals = r2_df.values.astype(float).flatten()
+ymin_r2, ymax_r2 = local_ylim(r2_vals, include_zero=True, positive_only=True)
+ax.set_ylim(ymin_r2, min(1.02, ymax_r2))
+
+ax.legend(loc="best", frameon=False, fontsize=9)
+
+fig.tight_layout(rect=[0, 0, 1, 0.95])
+plt.show()
+
+# =========================================================
+# 7) FACTOR REGRESSIONS BY RATE REGIME (MONTHLY)
+# =========================================================
+
+df_regime = master.copy()
+df_regime["d2y_3m"] = df_regime["d2y"].rolling(3).sum()
+df_regime["Rate_Regime"] = df_regime["d2y_3m"].apply(classify_rate_state)
+
+print("\nMonth counts by regime (from master):")
+print(df_regime["Rate_Regime"].value_counts())
+
+def run_regression_by_regime(data, sector):
+    y = data[f"{sector}_excess"]
+    X = data[["MKT_RF", "SMB", "HML", "MOM", "d2y"]]
+    X = sm.add_constant(X)
+    model = sm.OLS(y, X).fit(cov_type="HC3")
+
+    coef = model.params["d2y"]
+    se = model.bse["d2y"]
+    t = model.tvalues["d2y"]
+    ci_low, ci_high = model.conf_int().loc["d2y"]
+
+    return coef, se, t, ci_low, ci_high, model.rsquared_adj
+
+results_regime = []
+
+for regime in ["Rising", "Neutral", "Falling"]:
+    sub = df_regime[df_regime["Rate_Regime"] == regime]
+
+    for sector in sector_order:
+        coef, se, t, lo, hi, r2 = run_regression_by_regime(sub, sector)
+        results_regime.append({
+            "Regime": regime,
+            "Sector": sector,
+            "gamma": coef,
+            "se": se,
+            "t": t,
+            "ci_low": lo,
+            "ci_high": hi,
+            "adj_r2": r2
+        })
+
+results_regime = pd.DataFrame(results_regime)
+
+print("\nRegression results by regime (monthly factor regressions):")
+display(results_regime)
+
+# Simple 1x3 plot (original style)
+fig, axes = plt.subplots(1, 3, figsize=(18, 5), sharey=True)
+regimes = ["Rising", "Neutral", "Falling"]
+
+for i, regime in enumerate(regimes):
+    ax = axes[i]
+    sub = results_regime[results_regime["Regime"] == regime].set_index("Sector").loc[sector_order]
+
+    x = np.arange(len(sector_order))
+    gamma = sub["gamma"].values
+    err = 1.96 * sub["se"].values
+
+    ax.bar(x, gamma)
+    ax.errorbar(x, gamma, yerr=err, fmt="none", capsize=5)
+    ax.axhline(0)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(sector_order, rotation=30)
+    ax.set_title(regime + " Rate Regime")
+    ax.grid(alpha=0.25)
+
+axes[0].set_ylabel("Coefficient on Change in 2-Year Yield")
+plt.suptitle("Interest-Rate Sensitivity Across Rate Regimes (Monthly Factor Regressions)")
+plt.tight_layout()
+plt.show()
+
+# Journal-style 1x3 plot (more polished)
+sector_labels = ["Small\nCap", "Mid\nCap", "Large\nCap", "Tech", "Health", "Real\nEstate"]
+regime_order = ["Rising", "Neutral", "Falling"]
+
+# For convenience, reuse name 'results' as in original plotting code
+results = results_regime.copy()
+
+all_vals = np.concatenate([
+    results["gamma"].values.astype(float),
+    results["ci_low"].values.astype(float),
+    results["ci_high"].values.astype(float)
+])
+ymin, ymax = local_ylim(all_vals, include_zero=True)
+
+panel_labels = ["(a)", "(b)", "(c)"]
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 5.8), sharey=True)
+
+for i, regime in enumerate(regime_order):
+    ax = axes[i]
+
+    sub = (
+        results[results["Regime"] == regime]
+        .set_index("Sector")
+        .reindex(sector_order)
+    )
+
+    x = np.arange(len(sector_order))
+    gamma = sub["gamma"].values.astype(float)
+    ci_low = sub["ci_low"].values.astype(float)
+    ci_high = sub["ci_high"].values.astype(float)
+    tvals = sub["t"].values.astype(float)
+
+    yerr = np.vstack([
+        gamma - ci_low,
+        ci_high - gamma
+    ])
+
+    ax.bar(
+        x,
+        gamma,
+        width=0.62,
+        alpha=0.9
+    )
+
+    ax.errorbar(
+        x,
+        gamma,
+        yerr=yerr,
+        fmt="none",
+        elinewidth=1.1,
+        capsize=4,
+        capthick=1.1
+    )
+
+    ax.axhline(0, linewidth=1.0)
+    ax.grid(axis="y", alpha=0.25)
+
+    ax.text(
+        0.02, 1.03, panel_labels[i],
+        transform=ax.transAxes,
+        fontsize=12,
+        fontweight="bold",
+        ha="left",
+        va="bottom"
+    )
+
+    ax.set_title(f"{regime} Rate Regime", fontsize=12, pad=10)
+    ax.set_xticks(x)
+    ax.set_xticklabels(sector_labels, fontsize=10)
+    ax.set_ylim(ymin, ymax)
+
+    for xi, yi, ti, lo, hi in zip(x, gamma, tvals, ci_low, ci_high):
+        if not np.isfinite(ti):
+            continue
+
+        if abs(ti) >= 2.58:
+            stars = "***"
+        elif abs(ti) >= 1.96:
+            stars = "**"
+        elif abs(ti) >= 1.645:
+            stars = "*"
+        else:
+            stars = ""
+
+        if stars:
+            offset = 0.03 * (ymax - ymin)
+            if yi >= 0:
+                ax.text(xi, hi + offset, stars, ha="center", va="bottom", fontsize=11)
+            else:
+                ax.text(xi, lo - offset, stars, ha="center", va="top", fontsize=11)
+
+axes[0].set_ylabel("Coefficient on Monthly Change in 2-Year Yield", fontsize=11)
+
+fig.tight_layout()
+plt.show()
+
+# =========================================================
+# 8) DAILY GARCH: RETURNS & VOLATILITY BY RATE STATE (WITH AND WITHOUT CI)
+# =========================================================
+
+# Attach Rate_State to daily returns
+daily_ret_with_month = daily_ret.copy()
+daily_ret_with_month["Month"] = daily_ret_with_month.index.to_period("M")
+
+daily_with_state = daily_ret_with_month.merge(
+    monthly_yield[["Month", "Rate_State"]],
+    on="Month",
+    how="left"
+)
+
+daily_with_state.index = daily_ret_with_month.index
+daily_with_state = daily_with_state.drop(columns=["Month"])
+daily_with_state = daily_with_state.dropna(subset=["Rate_State"])
+
+month_counts = (
+    monthly_yield.dropna(subset=["Rate_State"])
+    .groupby("Rate_State")["Month"]
+    .nunique()
+    .reindex(rate_state_order)
+    .fillna(0)
+    .astype(int)
+    .to_dict()
+)
+
+rows = []
+
+for state in rate_state_order:
+    sub = daily_with_state[daily_with_state["Rate_State"] == state]
+
+    for sector in sector_order:
+        s = sub[sector].dropna()
+
+        ann_ret = annualized_return_from_daily(s)
+        ann_vol = annualized_garch_vol_from_daily(s, p=GARCH_P, q=GARCH_Q)
+
+        rows.append({
+            "Rate_State": state,
+            "Sector": sector,
+            "Annualized_Return": ann_ret,
+            "GARCH_Annualized_Vol": ann_vol,
+            "N_Days": len(s)
+        })
+
+summary_simple = pd.DataFrame(rows)
+
+returns_table_simple = (
+    summary_simple.pivot(index="Rate_State", columns="Sector", values="Annualized_Return")
+    .reindex(rate_state_order)[sector_order]
+)
+
+vol_table_simple = (
+    summary_simple.pivot(index="Rate_State", columns="Sector", values="GARCH_Annualized_Vol")
+    .reindex(rate_state_order)[sector_order]
+)
+
+print("\nSample window (daily GARCH):", START_DATE, "to", END_DATE)
+print("\nMonth counts by rate state (daily GARCH pipeline):")
+print(pd.Series(month_counts))
+
+print("\nAnnualized returns (simple):")
+display(returns_table_simple.style.format(pct_fmt))
+
+print("\nGARCH annualized volatility (simple):")
+display(vol_table_simple.style.format(pct_fmt))
+
+quick_check = summary_simple.pivot_table(
+    index="Rate_State",
+    columns="Sector",
+    values=["Annualized_Return", "GARCH_Annualized_Vol"]
+)
+print("\nCombined quick-check table (simple):")
+display(quick_check.style.format(pct_fmt))
+
+# Simple 1x2 plot: returns & vol by regime (no CI)
+x = np.arange(len(sector_order))
+width = 0.24
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 6), sharex=True)
+
+# LEFT: returns
+ax = axes[0]
+
+ret_rising = (
+    summary_simple[summary_simple["Rate_State"] == "Rising"]
+    .set_index("Sector")
+    .reindex(sector_order)["Annualized_Return"]
+    .values.astype(float)
+)
+ret_neutral = (
+    summary_simple[summary_simple["Rate_State"] == "Neutral"]
+    .set_index("Sector")
+    .reindex(sector_order)["Annualized_Return"]
+    .values.astype(float)
+)
+ret_falling = (
+    summary_simple[summary_simple["Rate_State"] == "Falling"]
+    .set_index("Sector")
+    .reindex(sector_order)["Annualized_Return"]
+    .values.astype(float)
+)
+
+ret_rising_plot = 100.0 * ret_rising
+ret_neutral_plot = 100.0 * ret_neutral
+ret_falling_plot = 100.0 * ret_falling
+
+ax.bar(x - width, np.nan_to_num(ret_rising_plot, nan=0.0), width=width,
+       label=f"Rising ({month_counts.get('Rising', 0)} mo)")
+ax.bar(x,         np.nan_to_num(ret_neutral_plot, nan=0.0), width=width,
+       label=f"Neutral ({month_counts.get('Neutral', 0)} mo)")
+ax.bar(x + width, np.nan_to_num(ret_falling_plot, nan=0.0), width=width,
+       label=f"Falling ({month_counts.get('Falling', 0)} mo)")
+
+all_ret_vals = np.concatenate([ret_rising_plot, ret_neutral_plot, ret_falling_plot])
+ymin_ret, ymax_ret = local_ylim(all_ret_vals, include_zero=True, positive_only=False)
+
+ax.set_ylim(ymin_ret, ymax_ret)
+ax.axhline(0, linewidth=1)
+ax.grid(axis="y", alpha=0.25)
+ax.set_title("(a) Annualized Returns by Interest-Rate Regime (Simple)", fontsize=13)
+ax.set_ylabel("Annualized Return (%)", fontsize=11)
+ax.set_xticks(x)
+ax.set_xticklabels(sector_order, rotation=20, ha="right")
+
+# RIGHT: volatility
+ax = axes[1]
+
+vol_rising = (
+    summary_simple[summary_simple["Rate_State"] == "Rising"]
+    .set_index("Sector")
+    .reindex(sector_order)["GARCH_Annualized_Vol"]
+    .values.astype(float)
+)
+vol_neutral = (
+    summary_simple[summary_simple["Rate_State"] == "Neutral"]
+    .set_index("Sector")
+    .reindex(sector_order)["GARCH_Annualized_Vol"]
+    .values.astype(float)
+)
+vol_falling = (
+    summary_simple[summary_simple["Rate_State"] == "Falling"]
+    .set_index("Sector")
+    .reindex(sector_order)["GARCH_Annualized_Vol"]
+    .values.astype(float)
+)
+
+vol_rising_plot = 100.0 * vol_rising
+vol_neutral_plot = 100.0 * vol_neutral
+vol_falling_plot = 100.0 * vol_falling
+
+ax.bar(x - width, np.nan_to_num(vol_rising_plot, nan=0.0), width=width)
+ax.bar(x,         np.nan_to_num(vol_neutral_plot, nan=0.0), width=width)
+ax.bar(x + width, np.nan_to_num(vol_falling_plot, nan=0.0), width=width)
+
+all_vol_vals = np.concatenate([vol_rising_plot, vol_neutral_plot, vol_falling_plot])
+ymin_vol, ymax_vol = local_ylim(all_vol_vals, include_zero=True, positive_only=True)
+
+ax.set_ylim(ymin_vol, ymax_vol)
+ax.grid(axis="y", alpha=0.25)
+ax.set_title("(b) GARCH Annualized Volatility by Interest-Rate Regime (Simple)", fontsize=13)
+ax.set_ylabel("Annualized Volatility (%)", fontsize=11)
+ax.set_xticks(x)
+ax.set_xticklabels(sector_order, rotation=20, ha="right")
+
+handles, labels = axes[0].get_legend_handles_labels()
+fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False, fontsize=10)
+
+fig.tight_layout(rect=[0, 0, 1, 0.93])
+plt.show()
+
+# =========================================================
+# 9) DAILY GARCH WITH BOOTSTRAP CIs
+# =========================================================
+
+rows = []
+
+for state in rate_state_order:
+    sub = daily_with_state[daily_with_state["Rate_State"] == state]
+
+    for sector in sector_order:
+        s = sub[sector].dropna()
+
+        ann_ret = annualized_return_from_daily(s)
+        ann_vol = annualized_garch_vol_from_daily(s, p=GARCH_P, q=GARCH_Q)
+
+        ret_lo, ret_hi, _ = bootstrap_by_month(
+            s,
+            stat_func=annualized_return_from_daily,
+            n_boot=N_BOOT,
+            rng=rng
+        )
+
+        vol_lo, vol_hi, _ = bootstrap_by_month(
+            s,
+            stat_func=lambda x: annualized_garch_vol_from_daily(x, p=GARCH_P, q=GARCH_Q),
+            n_boot=N_BOOT,
+            rng=rng
+        )
+
+        rows.append({
+            "Rate_State": state,
+            "Sector": sector,
+            "Annualized_Return": ann_ret,
+            "Return_CI_Low": ret_lo,
+            "Return_CI_High": ret_hi,
+            "GARCH_Annualized_Vol": ann_vol,
+            "Vol_CI_Low": vol_lo,
+            "Vol_CI_High": vol_hi,
+            "N_Days": len(s)
+        })
+
+summary = pd.DataFrame(rows)
+
+print("\nSample window (daily GARCH with CI):", START_DATE, "to", END_DATE)
+print("\nMonth counts by rate state (CI pipeline):")
+print(pd.Series(month_counts))
+
+returns_table = (
+    summary.pivot(index="Rate_State", columns="Sector", values="Annualized_Return")
+    .reindex(rate_state_order)[sector_order]
+)
+print("\nAnnualized returns (with CI):")
+display(returns_table.style.format(pct_fmt))
+
+vol_table = (
+    summary.pivot(index="Rate_State", columns="Sector", values="GARCH_Annualized_Vol")
+    .reindex(rate_state_order)[sector_order]
+)
+print("\nGARCH annualized volatility (with CI):")
+display(vol_table.style.format(pct_fmt))
+
+print("\nSummary with confidence intervals:")
+display(
+    summary.style.format({
+        "Annualized_Return": pct_fmt,
+        "Return_CI_Low": pct_fmt,
+        "Return_CI_High": pct_fmt,
+        "GARCH_Annualized_Vol": pct_fmt,
+        "Vol_CI_Low": pct_fmt,
+        "Vol_CI_High": pct_fmt
+    })
+)
+
+def extract_arrays(df, state, center_col, low_col, high_col):
+    sub = (
+        df[df["Rate_State"] == state]
+        .set_index("Sector")
+        .reindex(sector_order)
+    )
+
+    center = sub[center_col].values.astype(float)
+    low = sub[low_col].values.astype(float)
+    high = sub[high_col].values.astype(float)
+    return center, low, high
+
+ret_rising, ret_rising_lo, ret_rising_hi = extract_arrays(
+    summary, "Rising", "Annualized_Return", "Return_CI_Low", "Return_CI_High"
+)
+ret_neutral, ret_neutral_lo, ret_neutral_hi = extract_arrays(
+    summary, "Neutral", "Annualized_Return", "Return_CI_Low", "Return_CI_High"
+)
+ret_falling, ret_falling_lo, ret_falling_hi = extract_arrays(
+    summary, "Falling", "Annualized_Return", "Return_CI_Low", "Return_CI_High"
+)
+
+vol_rising, vol_rising_lo, vol_rising_hi = extract_arrays(
+    summary, "Rising", "GARCH_Annualized_Vol", "Vol_CI_Low", "Vol_CI_High"
+)
+vol_neutral, vol_neutral_lo, vol_neutral_hi = extract_arrays(
+    summary, "Neutral", "GARCH_Annualized_Vol", "Vol_CI_Low", "Vol_CI_High"
+)
+vol_falling, vol_falling_lo, vol_falling_hi = extract_arrays(
+    summary, "Falling", "GARCH_Annualized_Vol", "Vol_CI_Low", "Vol_CI_High"
+)
+
+ret_rising_plot = 100.0 * ret_rising
+ret_neutral_plot = 100.0 * ret_neutral
+ret_falling_plot = 100.0 * ret_falling
+
+ret_rising_err = 100.0 * make_err_arrays(ret_rising, ret_rising_lo, ret_rising_hi)
+ret_neutral_err = 100.0 * make_err_arrays(ret_neutral, ret_neutral_lo, ret_neutral_hi)
+ret_falling_err = 100.0 * make_err_arrays(ret_falling, ret_falling_lo, ret_falling_hi)
+
+vol_rising_plot = 100.0 * vol_rising
+vol_neutral_plot = 100.0 * vol_neutral
+vol_falling_plot = 100.0 * vol_falling
+
+vol_rising_err = 100.0 * make_err_arrays(vol_rising, vol_rising_lo, vol_rising_hi)
+vol_neutral_err = 100.0 * make_err_arrays(vol_neutral, vol_neutral_lo, vol_neutral_hi)
+vol_falling_err = 100.0 * make_err_arrays(vol_falling, vol_falling_lo, vol_falling_hi)
+
+x = np.arange(len(sector_order))
+width = 0.24
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 6), sharex=True)
+
+errkw = dict(elinewidth=1, capsize=3, capthick=1)
+
+# LEFT: RETURNS WITH CI
+ax = axes[0]
+
+ax.bar(
+    x - width,
+    np.nan_to_num(ret_rising_plot, nan=0.0),
+    width=width,
+    yerr=ret_rising_err,
+    error_kw=errkw,
+    label=f"Rising ({month_counts.get('Rising', 0)} mo)"
+)
+ax.bar(
+    x,
+    np.nan_to_num(ret_neutral_plot, nan=0.0),
+    width=width,
+    yerr=ret_neutral_err,
+    error_kw=errkw,
+    label=f"Neutral ({month_counts.get('Neutral', 0)} mo)"
+)
+ax.bar(
+    x + width,
+    np.nan_to_num(ret_falling_plot, nan=0.0),
+    width=width,
+    yerr=ret_falling_err,
+    error_kw=errkw,
+    label=f"Falling ({month_counts.get('Falling', 0)} mo)"
+)
+
+all_ret_vals = np.concatenate([
+    ret_rising_plot, ret_neutral_plot, ret_falling_plot,
+    100.0 * ret_rising_lo, 100.0 * ret_neutral_lo, 100.0 * ret_falling_lo,
+    100.0 * ret_rising_hi, 100.0 * ret_neutral_hi, 100.0 * ret_falling_hi
+])
+ymin_ret, ymax_ret = local_ylim(all_ret_vals, include_zero=True, positive_only=False)
+
+ax.set_ylim(ymin_ret, ymax_ret)
+ax.axhline(0, linewidth=1)
+ax.grid(axis="y", alpha=0.25)
+ax.set_title("(a) Annualized Returns by Interest-Rate Regime (with CI)", fontsize=13)
+ax.set_ylabel("Annualized Return (%)", fontsize=11)
+ax.set_xticks(x)
+ax.set_xticklabels(sector_order, rotation=20, ha="right")
+
+# RIGHT: VOLATILITY WITH CI
+ax = axes[1]
+
+ax.bar(
+    x - width,
+    np.nan_to_num(vol_rising_plot, nan=0.0),
+    width=width,
+    yerr=vol_rising_err,
+    error_kw=errkw
+)
+ax.bar(
+    x,
+    np.nan_to_num(vol_neutral_plot, nan=0.0),
+    width=width,
+    yerr=vol_neutral_err,
+    error_kw=errkw
+)
+ax.bar(
+    x + width,
+    np.nan_to_num(vol_falling_plot, nan=0.0),
+    width=width,
+    yerr=vol_falling_err,
+    error_kw=errkw
+)
+
+all_vol_vals = np.concatenate([
+    vol_rising_plot, vol_neutral_plot, vol_falling_plot,
+    100.0 * vol_rising_lo, 100.0 * vol_neutral_lo, 100.0 * vol_falling_lo,
+    100.0 * vol_rising_hi, 100.0 * vol_neutral_hi, 100.0 * vol_falling_hi
+])
+ymin_vol, ymax_vol = local_ylim(all_vol_vals, include_zero=True, positive_only=True)
+
+ax.set_ylim(ymin_vol, ymax_vol)
+ax.grid(axis="y", alpha=0.25)
+ax.set_title("(b) GARCH Annualized Volatility by Interest-Rate Regime (with CI)", fontsize=13)
+ax.set_ylabel("Annualized Volatility (%)", fontsize=11)
+ax.set_xticks(x)
+ax.set_xticklabels(sector_order, rotation=20, ha="right")
+
+handles, labels = axes[0].get_legend_handles_labels()
+fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False, fontsize=10)
+
+fig.suptitle(
+    f"U.S. Equity Sector Indices Across 2-Year Yield Regimes ({pd.Timestamp(START_DATE).year}–{pd.Timestamp(END_DATE).year})",
+    fontsize=15,
+    y=1.03
+)
+
+fig.tight_layout(rect=[0, 0, 1, 0.93])
+plt.show()
