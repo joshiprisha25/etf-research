@@ -5,7 +5,6 @@ except ImportError:
 from arch import arch_model
 # =========================================================
 # FULL PIPELINE: INDICES, FACTORS, REGIMES, GARCH, BOOTSTRAP, PLOTS
-# (Derived from Achint's code with minimal changes, no information removed)
 # =========================================================
 
 import warnings
