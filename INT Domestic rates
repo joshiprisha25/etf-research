@@ -1,0 +1,605 @@
+# ============================================
+# INTERNATIONAL EXTENSION — DOMESTIC POLICY + GLOBAL SECTORS
+# ============================================
+
+# 0) INSTALL DEPENDENCIES
+try:
+    from arch import arch_model
+except ImportError:
+    !pip install arch --quiet
+    from arch import arch_model
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import yfinance as yf
+from pandas_datareader import data as pdr
+from pandas_datareader.famafrench import FamaFrenchReader
+import statsmodels.api as sm
+
+# ============================================
+# GLOBAL SETTINGS
+# ============================================
+
+START_DATE = "2000-01-01"
+
+today = pd.Timestamp.today().normalize()
+last_complete_month_end = (today.replace(day=1) - pd.Timedelta(days=1)).normalize()
+END_DATE = last_complete_month_end.strftime("%Y-%m-%d")
+
+RISE_THRESHOLD = 0.25
+FALL_THRESHOLD = -0.25
+RATE_CHANGE_LAG_MONTHS = 3
+MIN_OBS = 36  # monthly gamma regressions
+
+# COUNTRY ETFs (USD)
+country_etf_map = {
+    "US": "SPY",
+    "UK": "EWU",
+    "Germany": "EWG",
+    "Japan": "EWJ",
+    "Canada": "EWC",
+    "Australia": "EWA"
+}
+
+country_order = list(country_etf_map.keys())
+country_tickers = list(country_etf_map.values())
+
+# GLOBAL SECTOR ETFs (USD) — same as your original script
+sector_etf_map = {
+    "Global Tech": "IXN",
+    "Global Health": "IXJ",
+    "Global Energy": "IXC",
+    "Global Financials": "IXG",
+    "Global Comm": "IXP",
+    "Global Cons Staples": "KXI",
+    "Global Industrials": "EXI"
+}
+
+sector_order = list(sector_etf_map.keys())
+sector_tickers = list(sector_etf_map.values())
+
+regime_order = ["Rising", "Neutral", "Falling"]
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+def classify_rate_state(x):
+    if pd.isna(x):
+        return np.nan
+    if x > RISE_THRESHOLD:
+        return "Rising"
+    elif x < FALL_THRESHOLD:
+        return "Falling"
+    else:
+        return "Neutral"
+
+def run_ols_hc3(y, X, min_obs=MIN_OBS):
+    data = pd.concat([y, X], axis=1).dropna()
+    if data.shape[0] < min_obs:
+        return None
+    y_clean = data.iloc[:, 0]
+    X_clean = sm.add_constant(data.iloc[:, 1:])
+    model = sm.OLS(y_clean, X_clean).fit(cov_type="HC3")
+    return model
+
+def make_err_arrays(center, low, high):
+    lower = center - low
+    upper = high - center
+    lower = np.where(lower >= 0, lower, np.nan)
+    upper = np.where(upper >= 0, upper, np.nan)
+    return np.vstack([lower, upper])
+
+def local_ylim(vals, include_zero=False, positive_only=False):
+    vals = np.asarray(vals)
+    vals = vals[np.isfinite(vals)]
+    if len(vals) == 0:
+        return (-0.05, 0.05)
+    vmin, vmax = vals.min(), vals.max()
+    if include_zero:
+        vmin = min(vmin, 0)
+        vmax = max(vmax, 0)
+    if positive_only:
+        vmin = max(0, vmin)
+    margin = 0.15 * (vmax - vmin)
+    return (vmin - margin, vmax + margin)
+
+def to_month_period_index(df):
+    if not isinstance(df.index, pd.PeriodIndex):
+        df.index = pd.to_datetime(df.index).to_period("M")
+    return df
+
+def annualized_return_from_daily(returns):
+    returns = returns.dropna()
+    if len(returns) == 0:
+        return np.nan
+    gross = (1 + returns).prod()
+    return gross ** (252 / len(returns)) - 1
+
+def annualized_garch_vol_from_daily(returns):
+    returns = returns.dropna()
+    if len(returns) < 80:
+        return np.nan
+    x = 100 * returns
+    try:
+        model = arch_model(x, mean="Constant", vol="GARCH", p=1, q=1, dist="normal", rescale=False)
+        res = model.fit(disp="off")
+        cond_vol = res.conditional_volatility
+        return cond_vol.mean() / 100 * np.sqrt(252)
+    except:
+        return np.nan
+
+def bootstrap_by_month(series, stat_func, n_boot=300, rng=None):
+    if rng is None:
+        rng = np.random.default_rng(42)
+    series = series.dropna()
+    if len(series) == 0:
+        return np.nan, np.nan, np.array([])
+    df = series.to_frame("ret")
+    df["Month"] = df.index.to_period("M")
+    groups = [g["ret"] for _, g in df.groupby("Month")]
+    if len(groups) < 6:
+        return np.nan, np.nan, np.array([])
+    stats = []
+    for _ in range(n_boot):
+        idx = rng.integers(0, len(groups), size=len(groups))
+        sampled = pd.concat([groups[i] for i in idx])
+        val = stat_func(sampled)
+        if np.isfinite(val):
+            stats.append(val)
+    stats = np.array(stats)
+    if len(stats) == 0:
+        return np.nan, np.nan, stats
+    return np.percentile(stats, 2.5), np.percentile(stats, 97.5), stats
+
+# ============================================
+# DATA DOWNLOAD — PRICES (COUNTRY + SECTOR)
+# ============================================
+
+print("Downloading ETF prices (monthly + daily)...")
+
+raw = yf.download(
+    tickers=country_tickers + sector_tickers,
+    start=START_DATE,
+    end=(pd.Timestamp(END_DATE) + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+    auto_adjust=True,
+    progress=False
+)
+
+prices = raw["Close"].copy().dropna(how="all")
+
+# Split into country + sector
+prices_country = prices[country_tickers].copy()
+prices_country.columns = country_order
+
+prices_sector = prices[sector_tickers].copy()
+prices_sector.columns = sector_order
+
+# Monthly returns
+monthly_prices = prices.resample("M").last()
+monthly_ret = monthly_prices.pct_change().dropna(how="all")
+monthly_ret.index = monthly_ret.index.to_period("M")
+
+monthly_ret_country = monthly_ret[country_tickers].copy()
+monthly_ret_country.columns = country_order
+
+monthly_ret_sector = monthly_ret[sector_tickers].copy()
+monthly_ret_sector.columns = sector_order
+
+# Daily returns (for GARCH later)
+daily_ret_country = prices_country.pct_change().dropna()
+
+# ============================================
+# DOMESTIC 2-YEAR YIELDS (COUNTRIES)
+# ============================================
+
+print("Downloading domestic yields for countries...")
+
+# All from FRED: OECD 2-year government bond yields
+country_yield_series = {
+    "US":       ("DGS2", "fred"),
+    "UK":       ("IRLTLT01GBM156N", "fred"),
+    "Germany":  ("IRLTLT01DEM156N", "fred"),
+    "Japan":    ("IRLTLT01JPM156N", "fred"),
+    "Canada":   ("IRLTLT01CAM156N", "fred"),
+    "Australia":("IRLTLT01AUM156N", "fred")
+}
+
+monthly_yields_domestic = {}
+
+for c in country_order:
+    code, src = country_yield_series[c]
+    y = pdr.DataReader(code, src, START_DATE, END_DATE).ffill()
+    y_m = y.resample("M").mean()
+    y_m.index = y_m.index.to_period("M")
+    col = y_m.columns[0]
+
+    y_m["d2y"] = y_m[col].diff(1)
+    y_m["d2y_3m"] = y_m[col].diff(RATE_CHANGE_LAG_MONTHS)
+    y_m["Rate_State"] = y_m["d2y_3m"].apply(classify_rate_state)
+
+    monthly_yields_domestic[c] = y_m[["d2y", "Rate_State"]]
+
+# ============================================
+# U.S. 2-YEAR YIELD FOR GLOBAL SECTORS (AS IN ORIGINAL)
+# ============================================
+
+print("Downloading U.S. 2-year yield for sector analysis...")
+
+dgs2 = pdr.DataReader("DGS2", "fred", START_DATE, END_DATE).ffill()
+
+monthly_yield_us = dgs2.resample("M").mean()
+monthly_yield_us.index = monthly_yield_us.index.to_period("M")
+
+monthly_yield_us["d2y"] = monthly_yield_us["DGS2"].diff(1)
+monthly_yield_us["d2y_3m"] = monthly_yield_us["DGS2"].diff(RATE_CHANGE_LAG_MONTHS)
+monthly_yield_us["Rate_State"] = monthly_yield_us["d2y_3m"].apply(classify_rate_state)
+
+# ============================================
+# FAMA-FRENCH FACTORS (U.S. FF3, USED AS GLOBAL USD FACTORS)
+# ============================================
+
+print("Downloading Fama-French factors...")
+
+ff3_reader = FamaFrenchReader("F-F_Research_Data_Factors", start=START_DATE)
+ff3 = ff3_reader.read()[0]
+ff3 = ff3.rename(columns={"Mkt-RF": "MKT_RF", "RF": "RF"})
+ff3 = ff3[["MKT_RF", "RF"]] / 100.0
+ff3 = to_month_period_index(ff3)
+
+# ============================================
+# COUNTRY-SPECIFIC MASTER DATASETS (DOMESTIC POLICY)
+# ============================================
+
+print("Building country-specific master datasets (domestic policy)...")
+
+country_masters = {}
+
+for c in country_order:
+    tmp = (
+        monthly_ret_country[[c]]
+        .join(ff3, how="inner")
+        .join(monthly_yields_domestic[c], how="inner")
+    )
+    tmp[f"{c}_excess"] = tmp[c] - tmp["RF"]
+    country_masters[c] = tmp
+
+# ============================================
+# COUNTRY-LEVEL GAMMA REGRESSIONS (DOMESTIC Δ2Y)
+# ============================================
+
+print("Running domestic gamma regressions for countries...")
+
+results_full_domestic = []
+results_regime_domestic = []
+
+for c in country_order:
+    cm = country_masters[c]
+
+    # Full sample
+    y = cm[f"{c}_excess"]
+    X = cm[["MKT_RF", "d2y"]]
+    model = run_ols_hc3(y, X)
+    if model is not None:
+        ci = model.conf_int()
+        results_full_domestic.append({
+            "Country": c,
+            "gamma": model.params["d2y"],
+            "gamma_lo": ci.loc["d2y", 0],
+            "gamma_hi": ci.loc["d2y", 1]
+        })
+
+    # By domestic regime
+    for regime in regime_order:
+        sub = cm[cm["Rate_State"] == regime]
+        y_r = sub[f"{c}_excess"]
+        X_r = sub[["MKT_RF", "d2y"]]
+        model_r = run_ols_hc3(y_r, X_r)
+        if model_r is None:
+            continue
+        ci_r = model_r.conf_int()
+        results_regime_domestic.append({
+            "Country": c,
+            "Regime": regime,
+            "gamma": model_r.params["d2y"],
+            "gamma_lo": ci_r.loc["d2y", 0],
+            "gamma_hi": ci_r.loc["d2y", 1]
+        })
+
+results_full_domestic = pd.DataFrame(results_full_domestic)
+results_regime_domestic = pd.DataFrame(results_regime_domestic)
+
+# ============================================
+# FIGURE 1 — COUNTRY GAMMA (DOMESTIC POLICY)
+# ============================================
+
+print("Creating intl_domestic_rate_sensitivity.png...")
+
+def extract_gamma(df, regime=None):
+    if regime is None:
+        sub = df.set_index("Country").reindex(country_order)
+    else:
+        sub = df[df["Regime"] == regime].set_index("Country").reindex(country_order)
+    return (
+        sub["gamma"].values,
+        sub["gamma_lo"].values,
+        sub["gamma_hi"].values
+    )
+
+gamma_full, lo_full, hi_full = extract_gamma(results_full_domestic)
+gamma_rising, lo_rising, hi_rising = extract_gamma(results_regime_domestic, "Rising")
+gamma_neutral, lo_neutral, hi_neutral = extract_gamma(results_regime_domestic, "Neutral")
+gamma_falling, lo_falling, hi_falling = extract_gamma(results_regime_domestic, "Falling")
+
+err_full = make_err_arrays(gamma_full, lo_full, hi_full)
+err_rising = make_err_arrays(gamma_rising, lo_rising, hi_rising)
+err_neutral = make_err_arrays(gamma_neutral, lo_neutral, hi_neutral)
+err_falling = make_err_arrays(gamma_falling, lo_falling, hi_falling)
+
+all_vals = np.concatenate([
+    gamma_full, lo_full, hi_full,
+    gamma_rising, lo_rising, hi_rising,
+    gamma_neutral, lo_neutral, hi_neutral,
+    gamma_falling, lo_falling, hi_falling
+])
+ymin, ymax = local_ylim(all_vals, include_zero=True)
+
+fig, axes = plt.subplots(1, 4, figsize=(22, 5), sharey=True)
+
+panels = [
+    ("Full Sample", gamma_full, err_full),
+    ("Rising", gamma_rising, err_rising),
+    ("Neutral", gamma_neutral, err_neutral),
+    ("Falling", gamma_falling, err_falling)
+]
+
+for ax, (title, gamma, err) in zip(axes, panels):
+    x = np.arange(len(country_order))
+    ax.bar(x, gamma, width=0.7)
+    ax.errorbar(x, gamma, yerr=err, fmt="none", elinewidth=1, capsize=4)
+    ax.axhline(0, color="black", linewidth=1)
+    ax.set_title(title)
+    ax.set_xticks(x)
+    ax.set_xticklabels(country_order, rotation=20)
+    ax.set_ylim(ymin, ymax)
+    ax.grid(axis="y", alpha=0.3)
+
+axes[0].set_ylabel("Coefficient on Domestic Δ2Y")
+
+plt.tight_layout()
+plt.savefig("intl_domestic_rate_sensitivity.png", dpi=300)
+plt.close()
+
+print("Saved: intl_domestic_rate_sensitivity.png")
+
+# ============================================
+# DAILY GARCH + RETURNS + VOLATILITY (DOMESTIC REGIMES)
+# ============================================
+
+print("Computing GARCH volatility + bootstrap CIs under domestic regimes...")
+
+rows = []
+rng = np.random.default_rng(42)
+
+for c in country_order:
+    s_daily = daily_ret_country[[c]].copy()
+    s_daily["Month"] = s_daily.index.to_period("M")
+
+    rs = monthly_yields_domestic[c][["Rate_State"]]
+    s_daily = s_daily.merge(rs, left_on="Month", right_index=True, how="left")
+    s_daily = s_daily.drop(columns=["Month"]).dropna(subset=["Rate_State"])
+
+    for state in regime_order:
+        sub = s_daily[s_daily["Rate_State"] == state][c].dropna()
+        ann_ret = annualized_return_from_daily(sub)
+        ann_vol = annualized_garch_vol_from_daily(sub)
+        ret_lo, ret_hi, _ = bootstrap_by_month(sub, annualized_return_from_daily, rng=rng)
+        vol_lo, vol_hi, _ = bootstrap_by_month(sub, annualized_garch_vol_from_daily, rng=rng)
+        rows.append({
+            "Rate_State": state,
+            "Country": c,
+            "Annualized_Return": ann_ret,
+            "Return_CI_Low": ret_lo,
+            "Return_CI_High": ret_hi,
+            "GARCH_Annualized_Vol": ann_vol,
+            "Vol_CI_Low": vol_lo,
+            "Vol_CI_High": vol_hi
+        })
+
+summary_domestic = pd.DataFrame(rows)
+
+# ============================================
+# FIGURE 2 — RETURNS + VOLATILITY (DOMESTIC REGIMES)
+# ============================================
+
+print("Creating intl_domestic_country_returns_volatility.png...")
+
+def extract_arrays(df, state, col, lo, hi):
+    sub = df[df["Rate_State"] == state].set_index("Country").reindex(country_order)
+    return sub[col].values, sub[lo].values, sub[hi].values
+
+# Returns
+ret_rising, ret_rising_lo, ret_rising_hi = extract_arrays(summary_domestic, "Rising", "Annualized_Return", "Return_CI_Low", "Return_CI_High")
+ret_neutral, ret_neutral_lo, ret_neutral_hi = extract_arrays(summary_domestic, "Neutral", "Annualized_Return", "Return_CI_Low", "Return_CI_High")
+ret_falling, ret_falling_lo, ret_falling_hi = extract_arrays(summary_domestic, "Falling", "Annualized_Return", "Return_CI_Low", "Return_CI_High")
+
+# Volatility
+vol_rising, vol_rising_lo, vol_rising_hi = extract_arrays(summary_domestic, "Rising", "GARCH_Annualized_Vol", "Vol_CI_Low", "Vol_CI_High")
+vol_neutral, vol_neutral_lo, vol_neutral_hi = extract_arrays(summary_domestic, "Neutral", "GARCH_Annualized_Vol", "Vol_CI_Low", "Vol_CI_High")
+vol_falling, vol_falling_lo, vol_falling_hi = extract_arrays(summary_domestic, "Falling", "GARCH_Annualized_Vol", "Vol_CI_Low", "Vol_CI_High")
+
+# Convert to %
+ret_rising_plot = 100 * ret_rising
+ret_neutral_plot = 100 * ret_neutral
+ret_falling_plot = 100 * ret_falling
+
+vol_rising_plot = 100 * vol_rising
+vol_neutral_plot = 100 * vol_neutral
+vol_falling_plot = 100 * vol_falling
+
+# Error bars
+ret_rising_err = 100 * make_err_arrays(ret_rising, ret_rising_lo, ret_rising_hi)
+ret_neutral_err = 100 * make_err_arrays(ret_neutral, ret_neutral_lo, ret_neutral_hi)
+ret_falling_err = 100 * make_err_arrays(ret_falling, ret_falling_lo, ret_falling_hi)
+
+vol_rising_err = 100 * make_err_arrays(vol_rising, vol_rising_lo, vol_rising_hi)
+vol_neutral_err = 100 * make_err_arrays(vol_neutral, vol_neutral_lo, vol_neutral_hi)
+vol_falling_err = 100 * make_err_arrays(vol_falling, vol_falling_lo, vol_falling_hi)
+
+# Y-limits
+all_ret_vals = np.concatenate([ret_rising_plot, ret_neutral_plot, ret_falling_plot])
+ymin_ret, ymax_ret = local_ylim(all_ret_vals, include_zero=True)
+
+all_vol_vals = np.concatenate([vol_rising_plot, vol_neutral_plot, vol_falling_plot])
+ymin_vol, ymax_vol = local_ylim(all_vol_vals, include_zero=True, positive_only=True)
+
+x = np.arange(len(country_order))
+width = 0.24
+
+fig, axes = plt.subplots(1, 2, figsize=(18, 6), sharex=True)
+
+# Panel (a): Returns
+ax = axes[0]
+
+ax.bar(x - width, ret_rising_plot, width=width, label="Rising")
+ax.errorbar(x - width, ret_rising_plot, yerr=ret_rising_err, fmt="none", elinewidth=1, capsize=3)
+
+ax.bar(x, ret_neutral_plot, width=width, label="Neutral")
+ax.errorbar(x, ret_neutral_plot, yerr=ret_neutral_err, fmt="none", elinewidth=1, capsize=3)
+
+ax.bar(x + width, ret_falling_plot, width=width, label="Falling")
+ax.errorbar(x + width, ret_falling_plot, yerr=ret_falling_err, fmt="none", elinewidth=1, capsize=3)
+
+ax.set_ylim(ymin_ret, ymax_ret)
+ax.axhline(0, linewidth=1)
+ax.grid(axis="y", alpha=0.25)
+ax.set_title("(a) Annualized Returns by Domestic Rate Regime (USD)")
+ax.set_ylabel("Annualized Return (%)")
+ax.set_xticks(x)
+ax.set_xticklabels(country_order, rotation=20)
+
+# Panel (b): Volatility
+ax = axes[1]
+
+ax.bar(x - width, vol_rising_plot, width=width, label="Rising")
+ax.errorbar(x - width, vol_rising_plot, yerr=vol_rising_err, fmt="none", elinewidth=1, capsize=3)
+
+ax.bar(x, vol_neutral_plot, width=width, label="Neutral")
+ax.errorbar(x, vol_neutral_plot, yerr=vol_neutral_err, fmt="none", elinewidth=1, capsize=3)
+
+ax.bar(x + width, vol_falling_plot, width=width, label="Falling")
+ax.errorbar(x + width, vol_falling_plot, yerr=vol_falling_err, fmt="none", elinewidth=1, capsize=3)
+
+ax.set_ylim(ymin_vol, ymax_vol)
+ax.grid(axis="y", alpha=0.25)
+ax.set_title("(b) GARCH Annualized Volatility by Domestic Rate Regime (USD)")
+ax.set_ylabel("Annualized Volatility (%)")
+ax.set_xticks(x)
+ax.set_xticklabels(country_order, rotation=20)
+
+handles, labels = axes[0].get_legend_handles_labels()
+fig.legend(handles, labels, loc="upper center", ncol=3, frameon=False)
+
+plt.tight_layout(rect=[0, 0, 1, 0.93])
+plt.savefig("intl_domestic_country_returns_volatility.png", dpi=300)
+plt.close()
+
+print("Saved: intl_domestic_country_returns_volatility.png")
+
+# ============================================
+# SECTOR-LEVEL GAMMA REGRESSIONS (U.S. POLICY, GLOBAL SECTORS)
+# ============================================
+
+print("Running sector gamma regressions (U.S. policy, global sectors)...")
+
+sec_master = (
+    monthly_ret_sector
+    .join(ff3, how="inner")
+    .join(monthly_yield_us[["d2y", "Rate_State"]], how="inner")
+)
+
+for s in sector_order:
+    sec_master[f"{s}_excess"] = sec_master[s] - sec_master["RF"]
+
+sec_results = []
+
+for regime in regime_order:
+    sub = sec_master[sec_master["Rate_State"] == regime]
+    for s in sector_order:
+        y = sub[f"{s}_excess"]
+        X = sub[["MKT_RF", "d2y"]]
+        model = run_ols_hc3(y, X)
+        if model is None:
+            continue
+        ci = model.conf_int()
+        sec_results.append({
+            "Sector": s,
+            "Regime": regime,
+            "gamma": model.params["d2y"],
+            "gamma_lo": ci.loc["d2y", 0],
+            "gamma_hi": ci.loc["d2y", 1]
+        })
+
+sec_results = pd.DataFrame(sec_results)
+
+# ============================================
+# FIGURE 3 — SECTOR GAMMA (U.S. POLICY, GLOBAL SECTORS)
+# ============================================
+
+print("Creating intl_sector_sensitivity_us_policy.png...")
+
+def extract_sector_gamma(regime):
+    sub = sec_results[sec_results["Regime"] == regime].set_index("Sector").reindex(sector_order)
+    return (
+        sub["gamma"].values,
+        sub["gamma_lo"].values,
+        sub["gamma_hi"].values
+    )
+
+sg_rising, sg_rising_lo, sg_rising_hi = extract_sector_gamma("Rising")
+sg_neutral, sg_neutral_lo, sg_neutral_hi = extract_sector_gamma("Neutral")
+sg_falling, sg_falling_lo, sg_falling_hi = extract_sector_gamma("Falling")
+
+sg_rising_err = make_err_arrays(sg_rising, sg_rising_lo, sg_rising_hi)
+sg_neutral_err = make_err_arrays(sg_neutral, sg_neutral_lo, sg_neutral_hi)
+sg_falling_err = make_err_arrays(sg_falling, sg_falling_lo, sg_falling_hi)
+
+all_sg_vals = np.concatenate([
+    sg_rising, sg_rising_lo, sg_rising_hi,
+    sg_neutral, sg_neutral_lo, sg_neutral_hi,
+    sg_falling, sg_falling_lo, sg_falling_hi
+])
+ymin_sg, ymax_sg = local_ylim(all_sg_vals, include_zero=True)
+
+fig, axes = plt.subplots(1, 3, figsize=(22, 5), sharey=True)
+
+sector_panels = [
+    ("Rising", sg_rising, sg_rising_err),
+    ("Neutral", sg_neutral, sg_neutral_err),
+    ("Falling", sg_falling, sg_falling_err)
+]
+
+for ax, (title, gamma, err) in zip(axes, sector_panels):
+    x = np.arange(len(sector_order))
+    ax.bar(x, gamma, width=0.7)
+    ax.errorbar(x, gamma, yerr=err, fmt="none", elinewidth=1, capsize=4)
+    ax.axhline(0, color="black", linewidth=1)
+    ax.set_title(title)
+    ax.set_xticks(x)
+    ax.set_xticklabels(sector_order, rotation=25)
+    ax.set_ylim(ymin_sg, ymax_sg)
+    ax.grid(axis="y", alpha=0.3)
+
+axes[0].set_ylabel("Coefficient on Δ2Y (U.S. 2-year)")
+
+plt.tight_layout()
+plt.savefig("intl_sector_sensitivity_us_policy.png", dpi=300)
+plt.close()
+
+print("Saved: intl_sector_sensitivity_us_policy.png")
+print("\nALL FIGURES COMPLETE.")
